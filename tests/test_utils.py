@@ -1,8 +1,12 @@
-from numpy.testing import assert_raises, assert_equal
+import errno
+import pickle
 from six.moves import range, cPickle
+from numpy.testing import assert_raises, assert_equal
+from zmq import ZMQError
 
 from fuel.iterator import DataIterator
 from fuel.utils import do_not_pickle_attributes
+from fuel.utils.zmq import uninterruptible
 
 
 @do_not_pickle_attributes("non_picklable", "bulky_attr")
@@ -48,3 +52,18 @@ class TestDoNotPickleAttributes(object):
 
     def test_value_error_attribute_non_loaded(self):
         assert_raises(ValueError, getattr, NonLoadingClass(), 'attribute')
+
+
+def test_uninterruptible():
+    foo = []
+
+    def interrupter(a, b):
+        if len(foo) < 3:
+            foo.append(0)
+            raise ZMQError(errno=errno.EINTR)
+        return (len(foo) + a) / b
+
+    def noninterrupter():
+        return -1
+
+    assert uninterruptible(interrupter, 5,  2) == 4
