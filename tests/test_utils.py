@@ -90,7 +90,7 @@ class DummyWorker(DivideAndConquerWorker):
         socket.send_pyobj(number)
 
     def process(self, number):
-        return number ** 2
+        yield number ** 2
 
 
 class DummySink(DivideAndConquerSink):
@@ -100,6 +100,7 @@ class DummySink(DivideAndConquerSink):
         self.sum = 0
 
     def recv(self, socket):
+        self.messages_received += 1
         return socket.recv_pyobj()
 
     def done(self):
@@ -132,5 +133,4 @@ def test_localhost_divide_and_conquer_manager():
     manager.launch()
     manager.wait_for_sink()
     result = result_socket.recv_pyobj()
-    assert result == sum(i ** 2 for i in xrange(50))
-
+    assert result == sum(i ** 2 for i in range(50))
