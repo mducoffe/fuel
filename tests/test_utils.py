@@ -114,6 +114,10 @@ class DummySink(DivideAndConquerSink):
 
     def setup_sockets(self, context, *args, **kwargs):
         super(DummySink, self).setup_sockets(context, *args, **kwargs)
+        self.publisher = publisher = self.context.socket(zmq.PUB)
+        # set SNDHWM, so we don't drop messages for slow subscribers
+        publisher.sndhwm = 1100000
+        publisher.bind('tcp://*:{}'.format(self.result_port))
 
     def process(self, number_squared):
         print('Received', number_squared, 'for processing')
@@ -123,11 +127,6 @@ class DummySink(DivideAndConquerSink):
     def shutdown(self):
         print('SHUTTING DOWN!', self.sum)
         self._receiver.close()
-        # Socket to talk to clients
-        publisher = self.context.socket(zmq.PUB)
-        # set SNDHWM, so we don't drop messages for slow subscribers
-        publisher.sndhwm = 1100000
-        publisher.bind('tcp://*:{}'.format(self.result_port))
 
         # Socket to receive signals
         syncservice = self.context.socket(zmq.REP)
@@ -136,7 +135,7 @@ class DummySink(DivideAndConquerSink):
         syncservice.recv()
         # send synchronization reply
         syncservice.send(b'')
-        publisher.send_pyobj(self.sum)
+        self.publisher.send_pyobj(self.sum)
 
 
 def test_localhost_divide_and_conquer_manager():
@@ -149,7 +148,6 @@ def test_localhost_divide_and_conquer_manager():
                                                          sync_port),
                                                [DummyWorker(), DummyWorker()],
                                                ventilator_port, sink_port)
-    context = zmq.Context()
     manager.launch()
     context = zmq.Context()
 
