@@ -79,7 +79,7 @@ class DummyVentilator(DivideAndConquerVentilator):
         socket.send_pyobj(number)
 
     def produce(self):
-         # temporary workaround for race with workers on first message
+        # temporary workaround for race with workers on first message
         time.sleep(0.25)
         for i in range(1, 51):
             yield i
@@ -97,9 +97,8 @@ class DummyWorker(DivideAndConquerWorker):
 
 
 class DummySink(DivideAndConquerSink):
-    def __init__(self, result_port, sync_port):
+    def __init__(self, result_port):
         self.result_port = result_port
-        self.sync_port = sync_port
         self.messages_received = 0
         self.sum = 0
 
@@ -126,12 +125,10 @@ class DummySink(DivideAndConquerSink):
 
 def test_localhost_divide_and_conquer_manager():
     result_port = 59581
-    sync_port = 59582
     ventilator_port = 59583
     sink_port = 59584
     manager = LocalhostDivideAndConquerManager(DummyVentilator(),
-                                               DummySink(result_port,
-                                                         sync_port),
+                                               DummySink(result_port),
                                                [DummyWorker(), DummyWorker()],
                                                ventilator_port, sink_port)
     context = zmq.Context()
