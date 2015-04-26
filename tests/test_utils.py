@@ -110,15 +110,15 @@ class DummySink(DivideAndConquerSink):
     def done(self):
         return self.messages_received >= 50
 
-    def setup_sockets(self, context, *args, **kwargs):
-        super(DummySink, self).setup_sockets(context, *args, **kwargs)
+    def initialize_sockets(self, context, *args, **kwargs):
+        super(DummySink, self).initialize_sockets(context, *args, **kwargs)
         self.result_socket = self.context.socket(zmq.PUSH)
         self.result_socket.bind('tcp://*:{}'.format(self.result_port))
 
     def process(self, number_squared):
         self.sum += number_squared
 
-    def shutdown(self):
+    def teardown(self):
         self._receiver.close()
         self.result_socket.send_pyobj(self.sum)
 

@@ -85,10 +85,10 @@ def bind_to_addr_port_or_range(socket, addr_or_port, default_addr,
 class DivideAndConquerBase(object):
     """Base class for divide-and-conquer-over-ZMQ components."""
 
-    setup_done = False
+    sockets_done = False
 
     @abstractmethod
-    def setup_sockets(self, context):
+    def initialize_sockets(self, context):
         """Set up the receiver and sender sockets given a ZeroMQ context.
 
         Parameters
@@ -97,17 +97,30 @@ class DivideAndConquerBase(object):
             A ZeroMQ context.
 
         """
-        self.setup_done = True
+        self.sockets_done = True
         self.context = context
 
-    @abstractmethod
-    def run(self, context=None):
+    def run(self):
         """Start doing whatever this component needs to be doing."""
+        try:
+            self.verify_sockets()
+            self.setup()
+            self.work_loop()
+        finally:
+            self.teardown()
+            self.context.destroy()
 
-    def check_setup(self):
+    def setup(self):
+        """Called before any processing is done."""
+
+    def teardown(self):
+        """Called just before :method:`run` terminates."""
+
+    def verify_sockets(self):
         """Check that sockets have been set up, raise an error if not."""
-        if not self.setup_done:
-            raise ValueError('setup_sockets() must be called before run()')
+        if not self.sockets_done:
+            raise ValueError('initialize_sockets() must be called before '
+                             'run()')
 
 
 @six.add_metaclass(ABCMeta)
@@ -119,8 +132,8 @@ class DivideAndConquerVentilator(DivideAndConquerBase):
     def __init__(self):
         self.port = None
 
-    def setup_sockets(self, context, sender_spec, sender_hwm=None,
-                      sink_spec=None):
+    def initialize_sockets(self, context, sender_spec, sender_hwm=None,
+                           sink_spec=None):
         """Set up sockets for task dispatch.
 
         Parameters
@@ -152,27 +165,13 @@ class DivideAndConquerVentilator(DivideAndConquerBase):
                                                self.default_addr)
         self._sink = context.socket(zmq.PUSH)
         self._sink.connect(from_port_or_addr(sink_spec, 'tcp://localhost'))
-        super(DivideAndConquerVentilator, self).setup_sockets(context)
-
-    @abstractmethod
-    def send(self, socket, batch):
-        """Send produced batch of work over the socket.
-
-        Parameters
-        ----------
-        socket : zmq.Socket
-            The socket on which to send.
-        batch : object
-            Object representing a batch of work as yielded by
-            :method:`produce`.
-
-        """
+        super(DivideAndConquerVentilator, self).initialize_sockets(context)
 
     @abstractmethod
     def produce(self):
         """Generator that yields batches of work to send."""
 
-    def run(self):
+    def work_loop(self):
         """Send tasks to workers in a loop.
 
         Notes
@@ -189,13 +188,23 @@ class DivideAndConquerVentilator(DivideAndConquerBase):
         be fixed by a more complex request/reply-based messaging pattern.
 
         """
-        try:
-            self.check_setup()
-            self._sink.send(b'HELLO')
-            for batch in self.produce():
-                self.send(self._sender, batch)
-        finally:
-            self.context.destroy()
+        self._sink.send(b'HELLO')
+        for batch in self.produce():
+            self.send(self._sender, batch)
+
+    @abstractmethod
+    def send(self, socket, batch):
+        """Send produced batch of work over the socket.
+
+        Parameters
+        ----------
+        socket : zmq.Socket
+            The socket on which to send.
+        batch : object
+            Object representing a batch of work as yielded by
+            :method:`produce`.
+
+        """
 
 
 @six.add_metaclass(ABCMeta)
@@ -204,59 +213,23 @@ class DivideAndConquerWorker(DivideAndConquerBase):
 
     default_addr = 'tcp://localhost'
 
-    @abstractmethod
-    def recv(self, socket):
-        """Receive a message [from the ventilator] and return it.
+    def done(self):
+        """Indicate whether the worker should terminate.
 
-        Parameters
-        ----------
-        socket : zmq.Socket
-            A :class:`zmq.Socket` instance from which to receive.
-
-        Returns
-        -------
-        received : object
-            An object repreesnting results received on the wire, in
-            the format expected by :method:`process`.
+        Notes
+        -----
+        Usually, a worker *can't* know that no further work batches will
+        be dispatched, as it has no idea what other workers have done.
+        However there are restricted cases where it is predictable, and
+        one could potentially build in a mechanism for the ventilator
+        to communicate this information. The default implementation
+        returns `False` unconditionally.
 
         """
-        pass
+        return False
 
-    @abstractmethod
-    def send(self, socket, result):
-        """Send results over a socket [to the sink].
-
-        Parameters
-        ----------
-        socket : zmq.Socket
-            Socket on which to send results.
-        results : object
-            Object representing results as yielded by :func:`process`.
-
-        """
-        pass
-
-    @abstractmethod
-    def process(self, received):
-        """Generator that turns a received chunk into one or more outputs.
-
-        Parameters
-        ----------
-        received : object
-            A received object representing a batch of work as returned by
-            :method:`recv`.
-
-        Yields
-        ------
-        result : object
-            Object representing a result to be sent to the sink, in the
-            same format accepted by :method:`send`.
-
-        """
-        pass
-
-    def setup_sockets(self, context, receiver_spec, receiver_hwm,
-                      sender_spec, sender_hwm):
+    def initialize_sockets(self, context, receiver_spec, receiver_hwm,
+                           sender_spec, sender_hwm):
         """Set up sockets for receiving tasks and sending results.
 
         Parameters
@@ -276,7 +249,6 @@ class DivideAndConquerWorker(DivideAndConquerBase):
             is to not set one.
 
         """
-
         self._receiver = context.socket(zmq.PULL)
         if receiver_hwm is not None:
             self._receiver.hwm = receiver_hwm
@@ -286,22 +258,66 @@ class DivideAndConquerWorker(DivideAndConquerBase):
         if sender_hwm is not None:
             self._sender.hwm = sender_hwm
         self._sender.connect(from_port_or_addr(sender_spec, self.default_addr))
-        super(DivideAndConquerWorker, self).setup_sockets(context)
+        super(DivideAndConquerWorker, self).initialize_sockets(context)
 
-    def done(self):
-        """Indicate whether the worker should terminate.
+    @abstractmethod
+    def process(self, received):
+        """Generator that turns a received chunk into one or more outputs.
+
+        Parameters
+        ----------
+        received : object
+            A received object representing a batch of work as returned by
+            :method:`recv`.
+
+        Yields
+        ------
+        result : object
+            Object representing a result to be sent to the sink, in the
+            same format accepted by :method:`send`.
+
+        """
+
+    @abstractmethod
+    def recv(self, socket):
+        """Receive a message [from the ventilator] and return it.
+
+        Parameters
+        ----------
+        socket : zmq.Socket
+            A :class:`zmq.Socket` instance from which to receive.
+
+        Returns
+        -------
+        received : object
+            An object repreesnting results received on the wire, in
+            the format expected by :method:`process`.
+
+        """
+
+    @abstractmethod
+    def send(self, socket, result):
+        """Send results over a socket [to the sink].
+
+        Parameters
+        ----------
+        socket : zmq.Socket
+            Socket on which to send results.
+        results : object
+            Object representing results as yielded by :func:`process`.
+
+        """
+
+    def teardown(self):
+        """Called just before :method:`run` terminates.
 
         Notes
         -----
-        Usually, a worker *can't* know that no further work batches will
-        be dispatched, as it has no idea what other workers have done.
-        However there are restricted cases where it is predictable, and
-        one could potentially build in a mechanism for the ventilator
-        to communicate this information. The default implementation
-        returns `False` unconditionally.
+        In the default implementation, the worker will receive/process/send
+        indefinitely, and this method will only get called in case of
+        error.
 
         """
-        return False
 
     def work_loop(self):
         """Loop indefinitely receiving, processing and sending."""
@@ -309,10 +325,6 @@ class DivideAndConquerWorker(DivideAndConquerBase):
             received = self.recv(self._receiver)
             for output in self.process(received):
                 self.send(self._sender, output)
-
-    def run(self):
-        self.check_setup()
-        self.work_loop()
 
 
 @six.add_metaclass(ABCMeta)
@@ -324,21 +336,11 @@ class DivideAndConquerSink(DivideAndConquerBase):
     def __init__(self):
         self.port = None
 
-    @abstractmethod
-    def recv(self, socket):
-        """Receive and return results from a worker."""
-        pass
-
-    @abstractmethod
-    def process(self, results):
-        """Process a batch of results as returned by :method:`recv`."""
-        pass
-
     def done(self):
         """Indicate whether or not the sink should terminate."""
         return False
 
-    def setup_sockets(self, context, receiver_spec, receiver_hwm):
+    def initialize_sockets(self, context, receiver_spec, receiver_hwm):
         """Set up sockets for receiving results from workers.
 
         Parameters
@@ -357,26 +359,26 @@ class DivideAndConquerSink(DivideAndConquerBase):
             self._receiver.hwm = receiver_hwm
         self.port = bind_to_addr_port_or_range(self._receiver, receiver_spec,
                                                self.default_addr)
-        super(DivideAndConquerSink, self).setup_sockets(context)
+        super(DivideAndConquerSink, self).initialize_sockets(context)
 
-    def run(self):
-        self.check_setup()
+    @abstractmethod
+    def process(self, results):
+        """Process a batch of results as returned by :method:`recv`."""
+
+    @abstractmethod
+    def recv(self, socket):
+        """Receive and return results from a worker."""
+        pass
+
+    def work_loop(self):
+        """Set up the sink to receive batches from workers."""
         # Synchronize with the ventilator.
         sync_packet = self._receiver.recv()
-        import binascii
-        print(binascii.hexlify(sync_packet))
         assert sync_packet == b'HELLO'
-        try:
-            while not self.done():
-                self.process(self.recv(self._receiver))
-        except Exception as e:
-            print('Caught', e)
-            raise
-        finally:
-            self.shutdown()
-            self.context.destroy()
+        while not self.done():
+            self.process(self.recv(self._receiver))
 
-    def shutdown(self):
+    def teardown(self):
         """Called just before :method:`run` terminates.
 
         Notes
@@ -448,9 +450,9 @@ class LocalhostDivideAndConquerManager(object):
 
         """
         context = zmq.Context()
-        worker.setup_sockets(context, self.ventilator_port,
-                             self.worker_receiver_hwm, self.sink_port,
-                             self.worker_sender_hwm)
+        worker.initialize_sockets(context, self.ventilator_port,
+                                  self.worker_receiver_hwm, self.sink_port,
+                                  self.worker_sender_hwm)
         worker.run()
 
     def launch_ventilator(self):
@@ -462,8 +464,8 @@ class LocalhostDivideAndConquerManager(object):
 
         """
         context = zmq.Context()
-        self.ventilator.setup_sockets(context, self.ventilator_port,
-                                      self.ventilator_hwm, self.sink_port)
+        self.ventilator.initialize_sockets(context, self.ventilator_port,
+                                           self.ventilator_hwm, self.sink_port)
         self.ventilator.run()
 
     def launch_sink(self):
@@ -475,7 +477,7 @@ class LocalhostDivideAndConquerManager(object):
 
         """
         context = zmq.Context()
-        self.sink.setup_sockets(context, self.sink_port, self.sink_hwm)
+        self.sink.initialize_sockets(context, self.sink_port, self.sink_hwm)
         self.sink.run()
 
     def launch(self):
