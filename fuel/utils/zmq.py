@@ -173,6 +173,22 @@ class DivideAndConquerVentilator(DivideAndConquerBase):
         """Generator that yields batches of work to send."""
 
     def run(self):
+        """Send tasks to workers in a loop.
+
+        Notes
+        -----
+        This continues sending tasks until the generator returned by
+        :method:`produce` is exhausted.
+
+        As a synchronization measure, an initial message of `b'HELLO'`
+        is sent directly to the sink, to inform it to start receiving
+        tasks from workers. This creates a small race condition
+        between the synchronization message and the worker results
+        reaching the sink; however, it is a race which any non-trivial
+        worker will lose. This could (and perhaps should) eventually
+        be fixed by a more complex request/reply-based messaging pattern.
+
+        """
         try:
             self.check_setup()
             self._sink.send(b'HELLO')
@@ -190,7 +206,20 @@ class DivideAndConquerWorker(DivideAndConquerBase):
 
     @abstractmethod
     def recv(self, socket):
-        """Receive a message [from the ventilator] and return it."""
+        """Receive a message [from the ventilator] and return it.
+
+        Parameters
+        ----------
+        socket : zmq.Socket
+            A :class:`zmq.Socket` instance from which to receive.
+
+        Returns
+        -------
+        received : object
+            An object repreesnting results received on the wire, in
+            the format expected by :method:`process`.
+
+        """
         pass
 
     @abstractmethod
@@ -219,9 +248,9 @@ class DivideAndConquerWorker(DivideAndConquerBase):
 
         Yields
         ------
-        tuple
-            Tuples of batches to be sent to the sink, used as arguments
-            to :method:`send`.
+        result : object
+            Object representing a result to be sent to the sink, in the
+            same format accepted by :method:`send`.
 
         """
         pass
