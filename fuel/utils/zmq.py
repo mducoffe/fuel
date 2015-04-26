@@ -132,8 +132,8 @@ class DivideAndConquerVentilator(DivideAndConquerBase):
     def __init__(self):
         self.port = None
 
-    def initialize_sockets(self, context, sender_spec, sender_hwm=None,
-                           sink_spec=None):
+    def initialize_sockets(self, context, sender_spec, sink_spec,
+                           sender_hwm=None):
         """Set up sockets for task dispatch.
 
         Parameters
@@ -144,13 +144,13 @@ class DivideAndConquerVentilator(DivideAndConquerBase):
             ventilator should listen for worker connections and send
             messages. If a port range is specified, a random port
             in the range will be bound within that range.
-        sender_hwm : int, optional
-            High water mark to set on the sender socket. Default
-            is to not set one.
         sink_spec : str or int
             The address (e.g. `tcp://somehost:5678`) or port (as an
             integer) on which the ventilator should connect to the
             sink in order to synchronize the start of work.
+        sender_hwm : int, optional
+            High water mark to set on the sender socket. Default
+            is to not set one.
 
         Raises
         ------
@@ -465,7 +465,7 @@ class LocalhostDivideAndConquerManager(object):
         """
         context = zmq.Context()
         self.ventilator.initialize_sockets(context, self.ventilator_port,
-                                           self.ventilator_hwm, self.sink_port)
+                                           self.sink_port, self.ventilator_hwm)
         self.ventilator.run()
 
     def launch_sink(self):
