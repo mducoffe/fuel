@@ -159,8 +159,8 @@ class DivideAndConquerVentilator(DivideAndConquerBase):
 
         """
         self._sender = context.socket(zmq.PUSH)
-        # if self._sender.hwm is not None:
-        #     self._sender.hwm = sender_hwm
+        if sender_hwm is not None:
+            self._sender.hwm = sender_hwm
         self.port = bind_to_addr_port_or_range(self._sender, sender_spec,
                                                self.default_addr)
         self._sink = context.socket(zmq.PUSH)
