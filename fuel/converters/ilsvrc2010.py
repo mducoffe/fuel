@@ -12,7 +12,7 @@ import tarfile
 
 import h5py
 import numpy
-from PIL import Image
+from picklable_itertools.extras import equizip
 from scipy.io.matlab import loadmat
 from six.moves import zip, xrange
 from toolz.itertoolz import partition_all
