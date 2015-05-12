@@ -14,13 +14,14 @@ import h5py
 import numpy
 from PIL import Image
 from scipy.io.matlab import loadmat
-import six
 from six.moves import zip, xrange
 from toolz.itertoolz import partition_all
 import zmq
 
 from fuel.datasets import H5PYDataset
 from fuel.server import send_arrays, recv_arrays
+from fuel.utils.formats import tar_open
+from fuel.utils.image import pil_imread_rgb, square_crop
 from fuel.utils.logging import (SubprocessFailure, ProgressBarHandler,
                                 make_debug_logging_function,
                                 zmq_log_and_monitor,
@@ -273,7 +274,7 @@ def process_other_set(hdf5_file, archive, patch_archive, groundtruth,
     targets = hdf5_file['targets']
     filenames = hdf5_file['filenames']
     patch_images = extract_patch_images(patch_archive, which_set)
-    with _open_tar_file(archive) as tar:
+    with tar_open(archive) as tar:
         start = offset
         work_iter = cropped_resized_images_from_tar(tar, patch_images,
                                                     image_dim, groundtruth)
@@ -333,7 +334,7 @@ def train_set_ventilator(f, ventilator_port=5557, sink_port=5558,
         sink.connect('tcp://localhost:{}'.format(sink_port))
         # Signal the sink to start receiving. Required, according to ZMQ guide.
         sink.send(b'0')
-        with _open_tar_file(f) as tar:
+        with tar_open(f) as tar:
             for num, inner_tar in enumerate(tar):
                 with closing(tar.extractfile(inner_tar.name)) as f:
                     debug(status='SENDING_TAR', tar_filename=inner_tar.name,
@@ -573,44 +574,6 @@ def train_set_sink(hdf5_file, num_images, images_per_class,
     debug(status='DONE')
 
 
-def _open_tar_file(f):
-    """Open either a filename or a file-like object as a TAR file.
-
-    Parameters
-    ----------
-    f : str or file-like object
-        The filename or file-like object from which to read.
-
-    Returns
-    -------
-    TarFile
-        A `TarFile` instance.
-
-    """
-    if isinstance(f, six.string_types):
-        return tarfile.open(name=f)
-    else:
-        return tarfile.open(fileobj=f)
-
-
-def _imread(f):
-    """Read an image with PIL, convert to RGB if necessary.
-
-    Parameters
-    ----------
-    f : str or file-like object
-        Filename or file object from which to read image data.
-
-    Returns
-    -------
-    image : ndarray, 3-dimensional
-        RGB image data as a NumPy array with shape `(rows, cols, 3)`.
-
-    """
-    with closing(Image.open(f)) as f:
-        return numpy.array(f.convert('RGB'))
-
-
 def reshape_hwc_to_bchw(image):
     """Reshape an image to `(1, channels, image_height, image_width)`.
 
@@ -661,10 +624,10 @@ def load_image_from_tar_or_patch(tar, image_filename, patch_images):
     image = patch_images.get(os.path.basename(image_filename), None)
     if image is None:
         try:
-            image = _imread(tar.extractfile(image_filename))
+            image = pil_imread_rgb(tar.extractfile(image_filename))
         except (IOError, OSError):
             with gzip.GzipFile(fileobj=tar.extractfile(image_filename)) as gz:
-                image = _imread(gz)
+                image = pil_imread_rgb(gz)
     return image
 
 
@@ -745,51 +708,6 @@ def permutation_by_class(order, images_per_class):
     return result
 
 
-def square_crop(image, dim):
-    """Crop an image to the central square after resizing it.
-
-    Parameters
-    ----------
-    image : ndarray, 3-dimensional
-        An image represented as a 3D ndarray, with 3 color
-        channels represented as the third axis.
-    dim : int, optional
-        The length of the shorter side after resizing, and the
-        length of both sides after cropping. Default is 256.
-
-    Returns
-    -------
-    cropped : ndarray, 3-dimensional, shape `(dim, dim, 3)`
-        The image resized such that the shorter side is length
-        `dim`, with the longer side cropped to the central
-        `dim` pixels.
-
-    Notes
-    -----
-    This reproduces the preprocessing technique employed in [Kriz]_.
-
-    .. [Kriz] A. Krizhevsky, I. Sutskever and G.E. Hinton (2012).
-       "ImageNet Classification with Deep Convolutional Neural Networks."
-       *Advances in Neural Information Processing Systems 25* (NIPS 2012).
-
-    """
-    if image.ndim != 3 and image.shape[2] != 3:
-        raise ValueError("expected a 3-dimensional ndarray with last axis 3")
-    if image.shape[0] > image.shape[1]:
-        new_size = int(round(image.shape[0] / image.shape[1] * dim)), dim
-        pad = (new_size[0] - dim) // 2
-        slices = (slice(pad, pad + dim), slice(None))
-    else:
-        new_size = dim, int(round(image.shape[1] / image.shape[0] * dim))
-        pad = (new_size[1] - dim) // 2
-        slices = (slice(None), slice(pad, pad + dim))
-    with closing(Image.fromarray(image, mode='RGB')) as pil_image:
-        # PIL uses width x height, e.g. cols x rows, hence new_size backwards.
-        resized = numpy.array(pil_image.resize(new_size[::-1], Image.BICUBIC))
-    out = resized[slices]
-    return out
-
-
 def read_devkit(f):
     """Read relevant information from the development kit archive.
 
@@ -810,7 +728,7 @@ def read_devkit(f):
         distributed with the development kit code.
 
     """
-    with _open_tar_file(f) as tar:
+    with tar_open(f) as tar:
         # Metadata table containing class hierarchy, textual descriptions, etc.
         meta_mat = tar.extractfile(DEVKIT_META_PATH)
         synsets, cost_matrix = read_metadata(meta_mat)
@@ -922,7 +840,7 @@ def extract_patch_images(f, which_set):
         raise ValueError('which_set must be one of train, valid, or test')
     which_set = 'val' if which_set == 'valid' else which_set
     patch_images = {}
-    with _open_tar_file(f) as tar:
+    with tar_open(f) as tar:
         for info_obj in tar:
             if not info_obj.name.endswith('.JPEG'):
                 continue
@@ -933,7 +851,7 @@ def extract_patch_images(f, which_set):
             if file_which_set != which_set:
                 continue
             filename = tokens[-1]
-            image = _imread(tar.extractfile(info_obj.name))
+            image = pil_imread_rgb(tar.extractfile(info_obj.name))
             patch_images[filename] = image
     return patch_images
 
