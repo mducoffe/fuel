@@ -27,7 +27,6 @@ from fuel.utils.logging import (SubprocessFailure, ProgressBarHandler,
                                 zmq_log_and_monitor,
                                 configure_zmq_process_logger)
 from fuel.utils.zmq import uninterruptible
-from picklable_itertools.extras import equizip
 log = logging.getLogger(__name__)
 
 DEVKIT_ARCHIVE = 'ILSVRC2010_devkit-1.0.tar.gz'
