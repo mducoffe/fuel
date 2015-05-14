@@ -1,9 +1,9 @@
 from __future__ import division
 from contextlib import closing
+from functools import partial
 import gzip
 import io
 import itertools
-import multiprocessing
 import os
 import logging
 import os.path
@@ -21,12 +21,16 @@ import zmq
 from fuel.datasets import H5PYDataset
 from fuel.server import send_arrays, recv_arrays
 from fuel.utils.formats import tar_open
-from fuel.utils.image import pil_imread_rgb, square_crop
-from fuel.utils.logging import (SubprocessFailure, ProgressBarHandler,
-                                make_debug_logging_function,
-                                zmq_log_and_monitor,
+from fuel.utils.image import pil_imread_rgb, square_crop, reshape_hwc_to_bchw
+from fuel.utils.logging import (log_keys_values, SubprocessFailure,
+                                ProgressBarHandler, zmq_log_and_monitor,
                                 configure_zmq_process_logger)
-from fuel.utils.zmq import uninterruptible
+from fuel.utils.zmq import (uninterruptible,
+                            DivideAndConquerVentilator,
+                            DivideAndConquerWorker,
+                            DivideAndConquerSink,
+                            LocalhostDivideAndConquerManager)
+
 log = logging.getLogger(__name__)
 
 DEVKIT_ARCHIVE = 'ILSVRC2010_devkit-1.0.tar.gz'
@@ -73,11 +77,13 @@ def ilsvrc2010(input_directory, save_path, image_dim=256,
     worker_batch_size : int, optional
         The number of images the workers should send to the sink at a
         time.
+    output_filename : str, optional
+        The output filename for the HDF5 file. Default: 'ilsvrc2010.hdf5'.
 
     .. [ILSVRC2010WEB] http://image-net.org/challenges/LSVRC/2010/index
 
     """
-    debug = make_debug_logging_function(log, 'MAIN')
+    debug = partial(partial(log_keys_values, process_type='MAIN'), log)
 
     # Read what's necessary from the development kit.
     devkit_path = os.path.join(input_directory, DEVKIT_ARCHIVE)
@@ -124,38 +130,69 @@ def ilsvrc2010(input_directory, save_path, image_dim=256,
         f.create_dataset('filenames', shape=(n_total,),
                          dtype='S32')
         log.info('Processing training set...')
-        debug(status='STARTED_SET', which_set='train',
+        debug('STARTED_SET', which_set='train',
               total_images_in_set=n_train)
         process_train_set(f, train, patch, synsets['num_train_images'],
                           wnid_map, image_dim, num_workers,
                           worker_batch_size)
-        debug(status='FINISHED_SET', which_set='train')
+        debug('FINISHED_SET', which_set='train')
         ilsvrc_id_to_zero_based = dict(zip(synsets['ILSVRC2010_ID'],
                                        xrange(len(synsets))))
         valid_groundtruth = [ilsvrc_id_to_zero_based[id_]
                              for id_ in raw_valid_groundtruth]
         log.info('Processing validation set...')
-        debug(status='STARTED_SET', which_set='valid',
+        debug('STARTED_SET', which_set='valid',
               total_images_in_set=n_valid)
         for num_completed in process_other_set(f, valid, patch,
                                                valid_groundtruth,
                                                'valid', worker_batch_size,
                                                image_dim, n_train):
-            debug(status='WRITTEN', which_set='valid',
+            debug('WRITTEN', which_set='valid',
                   num_images_written_so_far=num_completed)
-        debug(status='FINISHED_SET', which_set='valid')
+        debug('FINISHED_SET', which_set='valid')
         test_groundtruth = [ilsvrc_id_to_zero_based[id_]
                             for id_ in raw_test_groundtruth]
         log.info('Processing test set...')
-        debug(status='STARTED_SET', which_set='test',
+        debug('STARTED_SET', which_set='test',
               total_images_in_set=n_test)
         for num_completed in process_other_set(f, test, patch,
                                                test_groundtruth,
                                                'test', worker_batch_size,
                                                image_dim, n_train + n_valid):
-            debug(status='WRITTEN', which_set='test',
+            debug('WRITTEN', which_set='test',
                   num_images_written_so_far=num_completed)
-        debug(status='FINISHED_SET', which_set='test')
+        debug('FINISHED_SET', which_set='test')
+
+
+class TrainSetProcessingManager(LocalhostDivideAndConquerManager):
+    def __init__(self, logging_port, *args, **kwargs):
+        super(TrainSetProcessingManager, self).__init__(*args, **kwargs)
+        self.logging_port = logging_port
+
+    def wait(self):
+        terminate = False
+        context = zmq.Context()
+        try:
+            zmq_log_and_monitor(self.logger, context,
+                                processes=[self.ventilator_process,
+                                           self.sink_process],
+                                logging_port=self.logging_port,
+                                failure_threshold=logging.ERROR)
+        except KeyboardInterrupt:
+            terminate = True
+            log.info('Keyboard interrupt received.')
+        except SubprocessFailure:
+            terminate = True
+            log.info('One or more substituent processes failed.')
+        except Exception:
+            terminate = True
+        finally:
+            log.info('Shutting down child processes...')
+            self.cleanup()
+            log.info('Killed child processes.')
+            context.destroy()
+            if terminate:
+                sys.exit(1)
 
 
 def process_train_set(hdf5_file, train_archive, patch_archive,
@@ -189,48 +226,17 @@ def process_train_set(hdf5_file, train_archive, patch_archive,
         to the sink at a time.
 
     """
-    n_train = sum(train_images_per_class)
-    ventilator = multiprocessing.Process(target=train_set_ventilator,
-                                         args=(train_archive,))
-    ventilator.start()
-    workers = [multiprocessing.Process(target=train_set_worker,
-                                       args=(patch_archive, wnid_map,
-                                             train_images_per_class,
-                                             image_dim,
-                                             worker_batch_size))
+    ventilator = TrainSetVentilator(train_archive, logging_port=5559)
+    workers = [TrainSetWorker(patch_archive, wnid_map, train_images_per_class,
+                              image_dim, worker_batch_size, logging_port=5559)
                for _ in xrange(num_workers)]
-    for worker in workers:
-        worker.start()
-    sink = multiprocessing.Process(target=train_set_sink,
-                                   args=(hdf5_file, n_train,
-                                         train_images_per_class))
-    sink.start()
-    terminate = False
-    try:
-        context = zmq.Context()
-        # Only monitor the ventilator/sink for aliveness. Workers should only
-        # terminate when there's an error.
-        zmq_log_and_monitor(log, context,
-                            processes=[ventilator, sink],
-                            failure_threshold=logging.ERROR)
-    except KeyboardInterrupt:
-        terminate = True
-        log.info('Keyboard interrupt received.')
-    except SubprocessFailure:
-        terminate = True
-        log.info('One or more substituent processes failed.')
-    except Exception:
-        terminate = True
-    finally:
-        log.info('Shutting down workers and ventilator...')
-        for worker in workers:
-            worker.terminate()
-        ventilator.terminate()
-        sink.terminate()
-        log.info('Killed child processes.')
-        if terminate:
-            context.destroy()
-            sys.exit(1)
+    # TODO: additional arguments: flush_frequency, shuffle_seed
+    sink = TrainSetSink(hdf5_file, train_images_per_class, logging_port=5559)
+    manager = TrainSetProcessingManager(ventilator=ventilator, sink=sink,
+                                        workers=workers, ventilator_port=5556,
+                                        sink_port=5558, logging_port=5559)
+    manager.launch()
+    manager.wait()
 
 
 def process_other_set(hdf5_file, archive, patch_archive, groundtruth,
@@ -288,314 +294,240 @@ def process_other_set(hdf5_file, archive, patch_archive, groundtruth,
             yield start - offset
 
 
-def train_set_ventilator(f, ventilator_port=5557, sink_port=5558,
-                         logging_port=5559, high_water_mark=10):
-    """Serves tasks to workers via ZeroMQ sockets.
+class HasZMQProcessLogger(object):
+    """Mixin that adds logic for seting up a ZMQ logging handler."""
+    def initialize_sockets(self, *args, **kwargs):
+        super(HasZMQProcessLogger, self).initialize_sockets(*args, **kwargs)
+        configure_zmq_process_logger(self.logger, self.context,
+                                     self.logging_port)
+
+
+class TrainSetVentilator(HasZMQProcessLogger, DivideAndConquerVentilator):
+    """Serves per-class TAR files to workers.
 
     Parameters
     ----------
-    f : str or file-like object
-        Path or file-handle to a TAR file containing TAR files,
-        where each inner TAR file contains images of a given class.
-    ventilator_port : int, optional
-        The port on which the ventilator should listen and push
-        messages, containing a TAR file of images of a given
-        class.
-    sink_port : int, optional
-        The port on which the sink is listening, used to send
-        one message to synchronize the start of processing.
-    logging_port : int, optional
-        The port on which a logger process is presumed to be listening,
-        to which the ventilator will connect and send `LogRecord`s (see
-        :func:`configure_zmq_process_logger`).
-    high_water_mark : int, optional
-        High water mark to set on the socket. Controls memory
-        usage when the workers get backed up. Default is 10.
-
-    Notes
-    -----
-    This function sends two messages for each inner TAR file it
-    encounters. The first is sent as a Python object: a tuple indicating
-    the number in the sequence of inner TAR files read and its filename.
-    The second is a raw byte stream containing the inner TAR file
-    itself.
+    train_archive : str or file-like object
+        The TAR file containing the training set.
+    logging_port : int
+        The port on localhost on which to open a `PUSH` socket
+        for sending :class:`logging.LogRecord`s.
 
     """
-    try:
-        context = zmq.Context()
-        configure_zmq_process_logger(log, context, logging_port)
-        debug = make_debug_logging_function(log, 'VENTILATOR')
-        debug(status='START')
-        sender = context.socket(zmq.PUSH)
-        sender.hwm = high_water_mark
-        sender.bind('tcp://*:{}'.format(ventilator_port))
-        sink = context.socket(zmq.PUSH)
-        sink.connect('tcp://localhost:{}'.format(sink_port))
-        # Signal the sink to start receiving. Required, according to ZMQ guide.
-        sink.send(b'0')
-        with tar_open(f) as tar:
-            for num, inner_tar in enumerate(tar):
-                with closing(tar.extractfile(inner_tar.name)) as f:
-                    debug(status='SENDING_TAR', tar_filename=inner_tar.name,
-                          number=num)
-                    uninterruptible(sender.send_pyobj, (num, inner_tar.name),
-                                    zmq.SNDMORE)
-                    uninterruptible(sender.send, f.read())
-                    debug(status='SENT_TAR', tar_filename=inner_tar.name,
-                          number=num)
-        log.debug('SHUTDOWN')
-    finally:
-        # Manually destroy the context so as to flush buffers. This avoids
-        # an interpreter garbage collection bug on Python >= 3.4.
-        context.destroy()
+    def __init__(self, train_archive, logging_port, **kwargs):
+        super(TrainSetVentilator, self).__init__(**kwargs)
+        self.train_archive = train_archive
+        self.logging_port = logging_port
+        self.number = 0
+
+    def produce(self):
+        with tar_open(self.train_archive) as tar:
+            for i, info in enumerate(tar):
+                with closing(tar.extractfile(info.name)) as inner:
+                    yield (i, info.name, inner.read())
+
+    def send(self, socket, batch):
+        i, name, data = batch
+        self.number += 1
+        self.debug('SENDING_TAR', tar_filename=name, number=self.number)
+        uninterruptible(socket.send_pyobj, (i, name), zmq.SNDMORE)
+        uninterruptible(socket.send, data)
+        self.debug('SENT_TAR', tar_filename=name, number=self.number)
 
 
-def train_set_worker(patch_images_archive, wnid_map, images_per_class,
-                     image_dim, worker_batch_size, ventilator_port=5557,
-                     sink_port=5558, logging_port=5559,
-                     receiver_high_water_mark=10, sender_high_water_mark=10):
-    """Launch a worker that receives TARs and processes the images inside.
+class TrainSetWorker(HasZMQProcessLogger, DivideAndConquerWorker):
+    """Receives per-class TARs; extracts, crops, resizes and sends JPEGs.
 
     Parameters
     ----------
-    patch_images_archive : str or file-like object
-        The path or file-handle from which to read the patch images
-        archive.
+    patch_archive :  str or file-like object
+        Filename or file handle for the TAR archive of patch images.
     wnid_map : dict
         A dictionary mapping WordNet IDs to class indices.
-    images_per_class : sequence
-        A sequence containing the number of images in each class,
-        with as many elements as there are classes.
-    ventilator_port : int
-        The port on which the worker should connect to the ventilator
-        and receive tasks.
-    sink_port : int
-        The port on which the worker should connect to the sink and
-        send completed batches of images.
-    logging_port : int
-        The port on which a logger process is presumed to be listening,
-        to which the worker will connect and send `LogRecord`s (see
-        :func:`configure_zmq_process_logger`).
-    receiver_high_water_mark : int, optional
-        Approximate size of the queue used to buffer incoming
-        messages received from the ventilator. Limits memory
-        consumption caused by holding too many large incoming messages
-        in memory. Default is 10.
-    sender_high_water_mark : int, optional
-        Approximate size of the queue used to buffer messages sent
-        to the sink. Limits memory consumption when the sink is
-        not writing fast enough to accomodate all incoming messages.
-        Default is 10.
+    images_per_class : sequence of int
+        A sequence containing the number of images in each class.
+        The sequence contains as many elements as there are classes.
+    image_dim : int
+        The width and height of the desired images after resizing and
+        central cropping.
+    batch_size : int, optional
+        The number of images the workers should send to the sink at a
+        time.
+    logging_port : int, optional
+        The port on localhost on which to open a `PUSH` socket
+        for sending :class:`logging.LogRecord`s (default: 5559).
 
     """
-    context = zmq.Context()
-    configure_zmq_process_logger(log, context, logging_port)
-    debug = make_debug_logging_function(log, 'WORKER')
+    def __init__(self, patch_archive, wnid_map, images_per_class,
+                 image_dim, batch_size, logging_port=5559, **kwargs):
+        super(TrainSetWorker, self).__init__(**kwargs)
+        self.patch_images = extract_patch_images(patch_archive, 'train')
+        self.wnid_map = wnid_map
+        self.images_per_class = images_per_class
+        self.image_dim = image_dim
+        self.batch_size = batch_size
+        self.logging_port = logging_port
 
-    # Set up ventilator->worker socket on the worker end.
-    receiver = context.socket(zmq.PULL)
-    receiver.hwm = receiver_high_water_mark
-    receiver.connect('tcp://localhost:{}'.format(ventilator_port))
-    debug(status='CONNECTED_VENTILATOR', port=ventilator_port)
+    def recv(self, socket):
+        number, name = uninterruptible(socket.recv_pyobj)
+        data = io.BytesIO(uninterruptible(socket.recv))
+        return number, name, data
 
-    # Set up worker->sink socket on the worker end.
-    sender = context.socket(zmq.PUSH)
-    sender.hwm = sender_high_water_mark
-    sender.connect('tcp://localhost:{}'.format(sink_port))
-    debug(status='CONNECTED_SINK', port=sink_port)
+    def send(self, socket, results):
+        label, images, filenames = results
+        self.debug('SENDING_BATCH', tar_filename=self.current_tar_filename,
+                   number=self.current_tar_number, num_images=len(images),
+                   total_so_far=self.current_tar_images_processed, label=label)
+        uninterruptible(socket.send_pyobj, label, zmq.SNDMORE)
+        uninterruptible(send_arrays, socket, [images, filenames])
+        self.debug('SENT_BATCH', tar_filename=self.current_tar_filename,
+                   number=self.current_tar_number,
+                   num_images=len(images), label=label,
+                   total_so_far=(self.current_tar_images_processed +
+                                 len(images)))
 
-    patch_images = extract_patch_images(patch_images_archive, 'train')
-
-    while True:
-        debug(status='RECEIVING_TAR')
-        num, name = uninterruptible(receiver.recv_pyobj)
-        label = wnid_map[name.split('.')[0]]
-        tar_data = io.BytesIO(receiver.recv())
-        debug(status='RECEIVED_TAR', tar_filename=name, number=num,
-              label_id=label)
-        # TODO: factor this with block (minus the Exception handler) out
-        # into a function/generator.
+    def process(self, batch):
+        number, name, tar_data = batch
+        label = self.wnid_map[name.split('.')[0]]
+        self.debug('RECEIVED_TAR', tar_filename=name, number=number,
+                   label_id=label)
         with tarfile.open(fileobj=tar_data) as tar:
-            debug(status='OPENED', tar_filename=name, number=num)
-            total_images = 0
+            self.debug('OPENED', tar_filename=name, number=number)
+            self.current_tar_images_processed = 0
+            self.current_tar_filename = name
+            self.current_tar_number = number
             # Send images to sink in batches of at most worker_batch_size.
-            try:
-                combined = cropped_resized_images_from_tar(tar, patch_images,
-                                                           image_dim)
-                for tuples in partition_all(worker_batch_size, combined):
-                    images, files, _ = zip(*tuples)
-                    debug(status='SENDING_BATCH', tar_filename=name,
-                          number=num, num_images=len(images),
-                          total_so_far=total_images, label=label)
-                    uninterruptible(sender.send_pyobj, label, zmq.SNDMORE)
-                    uninterruptible(send_arrays, sender,
-                                    [numpy.concatenate(images),
-                                     numpy.array(files, dtype='S32')])
-                    total_images += len(images)
-                    debug(status='SENT_BATCH', tar_filename=name, number=num,
-                          num_images=len(images), total_so_far=total_images,
-                          label=label)
-            except Exception:
-                log.error('WORKER(%d): Encountered error processing '
-                          '%s (%d images processed successfully)',
-                          os.getpid(), name, total_images,
-                          exc_info=1)
-        if total_images != images_per_class[label]:
+            combined = cropped_resized_images_from_tar(tar, self.patch_images,
+                                                       self.image_dim)
+            for tuples in partition_all(self.batch_size, combined):
+                images, files, _ = zip(*tuples)
+                yield (label, numpy.concatenate(images),
+                       numpy.array(files, dtype='S32'))
+                self.current_tar_images_processed += len(images)
+        if self.current_tar_images_processed != self.images_per_class[label]:
             log.error('WORKER(%d): For class %s (%d), expected %d images but '
                       'only found %d', os.getpid(), name.split('.')[0], label,
-                      images_per_class[label], total_images)
-        debug(status='FINISHED_TAR', tar_filename=name, number=num,
-              total=total_images, label=label)
-    debug(status='SHUTDOWN')
+                      self.images_per_class[label],
+                      self.current_tar_images_processed)
+        self.debug('FINISHED_TAR', tar_filename=name, number=number,
+                   total=self.current_tar_images_processed, label=label)
+
+    def handle_exception(self):
+        log.error('%s(%d): Encountered error processing %s '
+                  '(%d images processed successfully)',
+                  self.process_type, os.getpid(), self.current_filename,
+                  self.images_processed, exc_info=1)
 
 
-def train_set_sink(hdf5_file, num_images, images_per_class,
-                   flush_frequency=256, shuffle_seed=(2015, 4, 9),
-                   sink_port=5558, logging_port=5559, high_water_mark=10):
-    """Write batches of data incoming from workers into an HDF5 file.
+class TrainSetSink(HasZMQProcessLogger, DivideAndConquerSink):
+    """Writes incoming batches of processed images to a given HDF5 file.
 
     Parameters
     ----------
     hdf5_file : :class:`h5py.File` instance
-        HDF5 file handle to which to write. Assumes `features`, `targets`
-        and `filenames` already exist and have first dimension larger than
-        `sum(images_per_class)`.
-    num_images : int
-        The number of images we are expecting from the workers.
-    images_per_class : sequence
-        A sequence containing the number of images in each class,
-        with as many elements as there are classes.
-    flush_frequency : int, optional
-        The number of batches after which we should flush the HDF5
-        file to disk.
-    shuffle_seed : int or sequence
-        Seed for a `numpy.random.RandomState` used to shuffle the training
-        set order.
-    sink_port : int, optional
-        The port on which the sink should listen.
+        The HDF5 file with `features`, `targets` and `filenames`
+        datasets already created within.
+    images_per_class : sequence of int
+        A sequence containing the number of images in each class.
+        The sequence contains as many elements as there are classes.
     logging_port : int, optional
-        The port on which a logger process is presumed to be listening,
-        to which the sink will connect and send `LogRecord`s (see
-        :func:`configure_zmq_process_logger`).
-    high_water_mark : int, optional
-        The high water mark for the receiving socket. Controls memory
-        usage by ZeroMQ message buffers. Default is 10.
+        The port on localhost on which to open a `PUSH` socket
+        for sending :class:`logging.LogRecord`s (default: 5559).
+    flush_frequency : int, optional
+        How often, in number of batches, to call the `flush` method of
+        `hdf5_file` (default: 256).
+    shuffle_seed : int or sequence, optional
+        The seed to use for the random number generator that determines
+        the training set shuffling order.
 
     """
-    context = zmq.Context()
+    def __init__(self, hdf5_file, images_per_class,
+                 flush_frequency=256, logging_port=5559,
+                 shuffle_seed=(2015, 4, 9), **kwargs):
+        super(TrainSetSink, self).__init__(**kwargs)
+        self.hdf5_file = hdf5_file
+        self.flush_frequency = flush_frequency
+        self.logging_port = logging_port
+        self.shuffle_seed = shuffle_seed
+        rng = numpy.random.RandomState(shuffle_seed)
+        self.num_images_expected = sum(images_per_class)
+        order = rng.permutation(self.num_images_expected)
+        class_permutations = permutation_by_class(order, images_per_class)
+        self.class_orders = [iter(o) for o in class_permutations]
+        self.batches_received = 0
+        self.num_images_written = 0
+        self.images_sum = self._images_sq_sum = None
 
-    # Set up logging.
-    configure_zmq_process_logger(log, context, logging_port)
-    debug = make_debug_logging_function(log, 'SINK')
+    def done(self):
+        return self.num_images_written == self.num_images_expected
 
-    # Create a shuffling order and parcel it up into a list of iterators
-    # over class-sized sublists of the list.
-    all_order = numpy.random.RandomState(shuffle_seed).permutation(num_images)
-    orders = list(map(iter, permutation_by_class(all_order, images_per_class)))
+    def recv(self, socket):
+        self.debug('RECEIVING_BATCH')
+        label = uninterruptible(socket.recv_pyobj)
+        images, filenames = uninterruptible(recv_arrays, socket)
+        self.batches_received += 1
+        self.debug('RECEIVED_BATCH', label=label,
+                   num_images=images.shape[0], batch=self.batches_received)
+        return label, images, filenames
 
-    # Receive completed batches from the workers.
-    receiver = context.socket(zmq.PULL)
-    receiver.hwm = 10
-    receiver.bind('tcp://*:5558')
+    def process(self, batch):
+        label, images, files = batch
 
-    # Synchronize with the ventilator.
-    receiver.recv()
-    batches_received = 0
-    images_sum = None
-    images_sq_sum = None
-    num_images_written = 0
-    features = hdf5_file['features']
-    targets = hdf5_file['targets']
-    filenames = hdf5_file['filenames']
-    try:
-        while num_images_written < num_images:
-            # Receive a label and a batch of images.
-            debug(status='RECEIVING_BATCH')
-            label = uninterruptible(receiver.recv_pyobj)
-            images, files = uninterruptible(recv_arrays, receiver)
-            batches_received += 1
-            debug(status='RECEIVED_BATCH', label=label,
-                  num_images=images.shape[0], batch=batches_received)
+        # Delay creation of the sum arrays until we've got the first
+        # batch so that we can size them correctly.
+        if self.images_sum is None:
+            self.images_sum = numpy.zeros_like(images[0], dtype=numpy.float64)
+            self.images_sq_sum = numpy.zeros_like(self.images_sum)
 
-            # Delay creation of the sum arrays until we've got the first
-            # batch so that we can size them correctly.
-            if images_sum is None:
-                images_sum = numpy.zeros_like(images[0], dtype=numpy.float64)
-                images_sq_sum = numpy.zeros_like(images_sum)
+        # Grab the next few indices for this label. We partition the
+        # indices by class so that no matter which order we receive
+        # batches in, the final order is deterministic (because the
+        # images within a class always appear in a deterministic order,
+        # i.e. the order they are read out of the TAR file).
+        indices = sorted(itertools.islice(self.class_orders[label],
+                                          images.shape[0]))
+        self.hdf5_file['features'][indices] = images
+        labels = label * numpy.ones(images.shape[0], dtype=numpy.int16)
+        self.hdf5_file['targets'][indices] = labels
+        self.hdf5_file['filenames'][indices] = files
 
-            # Grab the next few indices for this label. We partition the
-            # indices by class so that no matter which order we receive
-            # batches in, the final order is deterministic (because the
-            # images within a class always appear in a deterministic order,
-            # i.e. the order they are read out of the TAR file).
-            indices = sorted(itertools.islice(orders[label], images.shape[0]))
-            features[indices] = images
-            targets[indices] = label * numpy.ones(images.shape[0],
-                                                  dtype=numpy.int16)
-            filenames[indices] = files
+        self.num_images_written += images.shape[0]
 
-            num_images_written += images.shape[0]
+        self.debug('WRITTEN', label=label,
+                   num_images=images.shape[0], batch=self.batches_received,
+                   num_images_written_so_far=self.num_images_written)
 
-            debug(status='WRITTEN', label=label,
-                  num_images=images.shape[0], batch=batches_received,
-                  num_images_written_so_far=num_images_written)
+        # Accumulate the sum and the sum of the square, for mean and
+        # variance statistics.
+        self.images_sum += images.sum(axis=0)
+        self.images_sq_sum += (images.astype(numpy.uint64) ** 2).sum(axis=0)
 
-            # Accumulate the sum and the sum of the square, for mean and
-            # variance statistics.
-            images_sum += images.sum(axis=0)
-            images_sq_sum += (images.astype(numpy.uint64) ** 2).sum(axis=0)
+        # Manually flush file to disk at regular intervals. Unsure whether
+        # this is strictly necessary.
+        if self.batches_received % self.flush_frequency == 0:
+            self.debug('FLUSH', hdf5_filename=self.hdf5_file.filename)
+            self.hdf5_file.flush()
 
-            # Manually flush file to disk at regular intervals. Unsure whether
-            # this is strictly necessary.
-            if batches_received % flush_frequency == 0:
-                debug(status='FLUSH', hdf5_filename=hdf5_file.filename)
-                hdf5_file.flush()
-    except Exception:
-        log.error('SINK(%d): encountered exception (%d images written)',
-                  os.getpid(), num_images_written, exc_info=1)
-        return
-
-    # Compute training set mean and variance.
-    train_mean = images_sum / num_images
-    train_std = numpy.sqrt(images_sq_sum / num_images - train_mean**2)
-    hdf5_file.create_dataset('features_train_mean', shape=train_mean.shape,
-                             dtype=train_mean.dtype)
-    hdf5_file.create_dataset('features_train_std', shape=train_std.shape,
-                             dtype=train_std.dtype)
-    hdf5_file['features_train_mean'][...] = train_mean
-    hdf5_file['features_train_std'][...] = train_std
-    # hdf5_file['features'].dims.create_scale(hdf5_file['features_train_mean'],
-    #                                         'train_mean')
-    # hdf5_file['features'].dims.create_scale(hdf5_file['features_train_std'],
-    #                                         'train_std')
-    # hdf5_file['features'].dims[0].attach_scale(hdf5_file['features_train_mean'])
-    # hdf5_file['features'].dims[0].attach_scale(hdf5_file['features_train_mean'])
-    debug(status='DONE')
-
-
-def reshape_hwc_to_bchw(image):
-    """Reshape an image to `(1, channels, image_height, image_width)`.
-
-    Parameters
-    ----------
-    image : ndarray, shape `(image_height, image_width, channels)`
-        The image to be resized.
-
-    Returns
-    -------
-    ndarray, shape `(1, channels, image_height, image_width)`
-        The same image data with the order of axes swapped, and a
-        singleton leading axis added, making it convenient to
-        pass a sequence of these to :func:`numpy.concatenate`.
-
-    Notes
-    -----
-    `(batch, channel, height, width)` is the standard format for Theano's
-    and cuDNN's convolution operations, so it makes most sense to store
-    data in that layout.
-
-    """
-    return image.transpose(2, 0, 1)[numpy.newaxis]
+    def finalize(self):
+        train_mean = self.images_sum / self.num_images_expected
+        train_std = numpy.sqrt(self.images_sq_sum / self.num_images_expected -
+                               train_mean**2)
+        self.hdf5_file.create_dataset('features_train_mean',
+                                      shape=train_mean.shape,
+                                      dtype=train_mean.dtype)
+        self.hdf5_file.create_dataset('features_train_std',
+                                      shape=train_std.shape,
+                                      dtype=train_std.dtype)
+        self.hdf5_file['features_train_mean'][...] = train_mean
+        self.hdf5_file['features_train_std'][...] = train_std
+        self.hdf5_file['features'].dims.create_scale(
+            self.hdf5_file['features_train_mean'], 'train_mean')
+        self.hdf5_file['features'].dims.create_scale(
+            self.hdf5_file['features_train_std'], 'train_std')
+        self.hdf5_file['features'].dims[0].attach_scale(
+            self.hdf5_file['features_train_mean'])
+        self.hdf5_file['features'].dims[0].attach_scale(
+            self.hdf5_file['features_train_std'])
 
 
 def load_image_from_tar_or_patch(tar, image_filename, patch_images):
@@ -644,7 +576,7 @@ def cropped_resized_images_from_tar(tar, patch_images, image_dim,
         it from the TAR file.
     images_dim : int
         The width and height of the returned resized-and-square-cropped
-        images (see :func:`square_crop`).
+        images (see :func:`fuel.utils.image.square_crop`).
     groundtruth : iterable, optional
         An iterable containing one integer label for each image in
         `filenames` (or each regular image in `tar` if `filenames`
@@ -659,7 +591,8 @@ def cropped_resized_images_from_tar(tar, patch_images, image_dim,
     image
         An image drawn from either the TAR archive or the `patch_images`
         dictionary (see :func:`load_image_from_tar_or_patch`), cropped
-        and resized to `(image_dim, image_dim)` (see :func:`square_crop`).
+        and resized to `(image_dim, image_dim)` (see
+        :func:`fuel.utils.image.square_crop`).
     label
         An integer label for the given image, or `None` if no groundtruth
         was available.
@@ -687,8 +620,8 @@ def permutation_by_class(order, images_per_class):
         A sequence containing a permutation of the integers from
         0 to `len(order) - 1`.
     images_per_class : sequence
-        A sequence containing the number of images in each class,
-        with as many elements as there are classes.
+        A sequence containing the number of images in each class.
+        The sequence contains as many elements as there are classes.
 
     Returns
     -------

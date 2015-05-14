@@ -1,7 +1,9 @@
+from abc import ABCMeta
 import logging
 import os
 
 import progressbar
+import six
 import zmq
 
 
@@ -138,38 +140,74 @@ def configure_zmq_process_logger(logger, context, logging_port):
     logger.addHandler(ZMQLoggingHandler(socket))
 
 
-def make_debug_logging_function(logger, process_type):
-    """Return a callable for logging keyword argument-based debug messages.
+def log_keys_values(logger, status, process_type=None,
+                    level=logging.DEBUG, **kwargs):
+    """Log a standard-formed debug message to the given logger.
 
     Parameters
     ----------
     logger : object
         Logger-like object with a `debug()` method matching the
         signature of the same method from :class:`logging.Logger`.
-    process_type : str
+    status : str
+        A string displayed after `process_type` and the PID (if
+        `process_type` was provided), providing a short summary of the
+        condition.
+    process_type : str, optional
         A string that will be included at the beginning of each message,
-        along with the PID in parentheses.
+        along with the PID in parentheses. If not provided, this part
+        of the string will be dropped and `status` will appear first.
+    level : int, optional
+        The log level at which to log the message. Defaults to
+        `logging.DEBUG`.
 
-    Returns
-    -------
-    debug_log_fn : callable
-        A function that expects one mandatory argument `status`, and
-        as many keyword arguments as desired. The keywords and their
-        values will appear in the log message as *key=value* (sorted
-        by key), and will also be available as attributes on the
-        corresponding `LogRecord` object.
+    \*\*kwargs
+        Additional keyword arguments are rendered as `key=value` pairs
+        in the
+    Notes
+    -----
+    This is designed to produce easy to interpret logs in contexts
+    where multiple processes may be logging
+    Logs messages of the form
+
+    .. code-block::
+        PROCESS_TYPE(PID): STATUS key1=val1 key2=val2 key3=val3
+
+    All arguments to this function (including `process_type` and
+    `status`) are passed in the `extras` dictionary to `logger.debug`,
+    and are thus available as attributes on the corresponding
+    `LogRecord` object.
 
     """
-    def _debug(status, **kwargs):
-        pid = os.getpid()
+    pid = os.getpid()
+    if process_type is not None:
         message_str = '{process_type}({pid}): {status} '.format(
             process_type=process_type, pid=pid, status=status)
-        message_str += ' '.join('{key}={val}'.format(key=key, val=kwargs[key])
-                                for key in sorted(kwargs))
+    else:
+        message_str = '{status} '.format(status=status)
+    message_str += ' '.join('{key}={val}'.format(key=key, val=kwargs[key])
+                            for key in sorted(kwargs))
+    if process_type is not None:
         kwargs['process_type'] = process_type
-        kwargs['status'] = status
-        logger.debug(message_str, extra=kwargs)
-    return _debug
+    kwargs['status'] = status
+    logger.log(level, message_str, extra=kwargs)
+
+
+@six.add_metaclass(ABCMeta)
+class HasKeyValueDebugMethod(object):
+    """Provides a :method:`debug` method, wrapping `log_keys_values`.
+
+    Notes
+    -----
+    Expects instances which inherit to have a `logger` and (optionally)
+    a `process_type` attribute.
+
+    """
+
+    def debug(self, status, **kwargs):
+        log_keys_values(self.logger, status,
+                        getattr(self, 'process_type', None),
+                        level=logging.DEBUG, **kwargs)
 
 
 def zmq_log_and_monitor(logger, context, processes=(), logging_port=5559,

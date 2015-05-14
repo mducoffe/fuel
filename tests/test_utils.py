@@ -97,7 +97,8 @@ class DummyWorker(DivideAndConquerWorker):
 
 
 class DummySink(DivideAndConquerSink):
-    def __init__(self, result_port):
+    def __init__(self, result_port, **kwargs):
+        super(DummySink, self).__init__(**kwargs)
         self.result_port = result_port
         self.messages_received = 0
         self.sum = 0
@@ -136,9 +137,5 @@ def test_localhost_divide_and_conquer_manager():
     socket.connect('tcp://localhost:{}'.format(result_port))
     manager.launch()
     result = socket.recv_pyobj()
-    manager.wait_for_sink()
+    manager.wait()
     assert result == sum(i ** 2 for i in range(1, 51))
-
-
-if __name__ == "__main__":
-    test_localhost_divide_and_conquer_manager()
